@@ -1,3 +1,4 @@
+[21 fosforos.py](https://github.com/user-attachments/files/22584873/21.fosforos.py)
 print("Bem vindo ao jogo dos fósforos!")
 
 n = 21
@@ -46,7 +47,5 @@ while n > 1:
     n -= jogada
     print("Restam" , n , "fósforos")
     if n == 1:
-          print("Fim do jogo! Ganhaste! :)")
-          break
-       )")
+           print("Fim do jogo! Ganhaste! :)")
            break
