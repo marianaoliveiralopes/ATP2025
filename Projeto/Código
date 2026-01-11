@@ -1,0 +1,673 @@
+import FreeSimpleGUI as sg
+import random
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import numpy as np
+import heapq
+import json
+import csv
+import os
+import calendar
+from datetime import datetime, timedelta
+
+# =============================================================================
+# 1. GESTÃO DE DADOS (JSON)
+# =============================================================================
+
+NOME_ARQUIVO_DB = "pacientes.json"
+
+def formatar_hora(minutos_desde_abertura):
+    """Converte minutos desde a abertura (08:00) para formato HH:MM."""
+    if minutos_desde_abertura is None: return "N/A"
+    hora_abertura = datetime.strptime("08:00", "%H:%M")
+    hora_atual = hora_abertura + timedelta(minutes=minutos_desde_abertura)
+    return hora_atual.strftime("%H:%M")
+
+def criar_json_cenario(taxa_chegada=5):
+    """Gera um novo cenário de pacientes com base na taxa de chegada."""
+    dados = []
+    nomes_ex = ["Ana", "Bruno", "Carlos", "Diana", "Eduardo", "Fernanda", "Gustavo", "Helena", "Igor", "Julia"]
+    esps = ["Clínica Geral", "Cardiologia", "Ortopedia"]
+    
+    qtd = int(taxa_chegada * 8)
+    
+    for i in range(1, qtd + 1):
+        p = {
+            "id": i,
+            "nome": f"{random.choice(nomes_ex)} {i}",
+            "idade": random.randint(1, 95),
+            "especialidade": random.choice(esps),
+            "prioridade": random.choice([1, 2, 3]),
+            "tempo_chegada": round(random.uniform(0, 480), 1) 
+        }
+        dados.append(p)
+    
+    dados.sort(key=lambda x: x["tempo_chegada"])
+    
+    with open(NOME_ARQUIVO_DB, "w", encoding="utf-8") as f:
+        json.dump(dados, f, indent=4, ensure_ascii=False)
+    return qtd
+
+def carregar_pacientes_db():
+    if not os.path.exists(NOME_ARQUIVO_DB):
+        criar_json_cenario()
+    
+    resultado = []
+    if os.path.exists(NOME_ARQUIVO_DB) and os.path.getsize(NOME_ARQUIVO_DB) > 0:
+        with open(NOME_ARQUIVO_DB, "r", encoding="utf-8") as f:
+            resultado = json.load(f)
+    return resultado
+
+def importar_json_externo(caminho_origem, taxa_chegada=5):
+    sucesso = False
+    if os.path.exists(caminho_origem) and os.path.getsize(caminho_origem) > 0:
+        with open(caminho_origem, "r", encoding="utf-8") as f:
+            dados_brutos = json.load(f)
+        
+        if isinstance(dados_brutos, list):
+            qtd_alvo = int(taxa_chegada * 8)
+            if len(dados_brutos) > qtd_alvo:
+                selecionados = random.sample(dados_brutos, qtd_alvo)
+            else:
+                selecionados = dados_brutos
+            
+            dados_processados = []
+            for i, p in enumerate(selecionados):
+                p_novo = {
+                    "id": p.get("id", i + 1),
+                    "nome": p.get("nome", f"Paciente {i+1}"),
+                    "idade": p.get("idade", random.randint(1, 90)),
+                    "especialidade": p.get("especialidade", random.choice(["Clínica Geral", "Cardiologia", "Ortopedia"])),
+                    "prioridade": random.choice([1, 2, 3]),
+                    "tempo_chegada": round(random.uniform(0, 480), 1)
+                }
+                dados_processados.append(p_novo)
+            
+            dados_processados.sort(key=lambda x: x["tempo_chegada"])
+            
+            with open(NOME_ARQUIVO_DB, "w", encoding="utf-8") as f:
+                json.dump(dados_processados, f, indent=4, ensure_ascii=False)
+            sucesso = True
+    return sucesso
+
+# =============================================================================
+# 2. MOTOR LÓGICO
+# =============================================================================
+
+class Doente:
+    def __init__(self, dados):
+        self.id_sim = dados.get("id", 0)
+        self.nome = dados.get("nome", "Desconhecido")
+        self.idade = dados.get("idade", "N/A")
+        self.especialidade = dados.get("especialidade", "Clínica Geral")
+        self.prioridade = dados.get("prioridade", 3)
+        self.tempo_chegada = dados.get("tempo_chegada", 0.0)
+        self.tempo_inicio = None
+        self.tempo_saida = None
+        self.medico_nome = ""
+        self.obj_medico = None
+        self.tempo_na_fila = 0.0
+
+    def espera(self):
+        if self.tempo_inicio is not None:
+            return max(0.0, self.tempo_inicio - self.tempo_chegada)
+        return 0.0
+    
+    def duracao(self):
+        if self.tempo_saida is not None and self.tempo_inicio is not None:
+            return self.tempo_saida - self.tempo_inicio
+        return 0.0
+
+    def __lt__(self, other):
+        if self.prioridade != other.prioridade:
+            return self.prioridade < other.prioridade
+        if self.tempo_na_fila != other.tempo_na_fila:
+            return self.tempo_na_fila > other.tempo_na_fila
+        return self.tempo_chegada < other.tempo_chegada
+
+class Medico:
+    def __init__(self, id_med, especialidade):
+        self.id = id_med
+        self.especialidade = especialidade
+        self.livre = True
+        self.tempo_ocupado_total = 0.0
+
+class Simulador:
+    def __init__(self, lista_pacientes_json, config):
+        self.media_serv = float(config["tempo_medio"])
+        self.tipo_dist = config["distribuicao"]
+        self.tempo_total = int(config["tempo_total"])
+        
+        self.medicos = []
+        c = 1
+        for esp, qtd in config["qtd_especialidades"].items():
+            for _ in range(qtd):
+                self.medicos.append(Medico(c, esp))
+                c += 1
+        
+        self.tempo = 0.0
+        self.filas = {esp: [] for esp in config["qtd_especialidades"].keys()}
+        self.eventos = [] 
+        self.atendidos = []
+        
+        self.log_fila = [(0.0, 0)]
+        self.log_ocupacao = [(0.0, 0.0)]
+        self.intervalo_log = 10 
+        self.proximo_log = self.intervalo_log
+
+        for dados_p in lista_pacientes_json:
+            if dados_p.get("tempo_chegada", 0) < self.tempo_total:
+                novo_doente = Doente(dados_p)
+                heapq.heappush(self.eventos, (novo_doente.tempo_chegada, "CHEGADA", novo_doente))
+
+    def gerar_tempo_servico(self):
+        if self.tipo_dist == "Exponencial":
+            return random.expovariate(1.0 / self.media_serv)
+        elif self.tipo_dist == "Normal":
+            return max(1.0, random.normalvariate(self.media_serv, self.media_serv * 0.25))
+        elif self.tipo_dist == "Uniforme":
+            return random.uniform(self.media_serv * 0.5, self.media_serv * 1.5)
+        return self.media_serv
+
+    def get_medico_livre(self, esp):
+        medico_encontrado = None
+        for m in self.medicos:
+            # Se ainda não encontrei ninguém, verifico este médico
+            if medico_encontrado is None:
+                if m.livre and m.especialidade == esp:
+                    medico_encontrado = m
+        return medico_encontrado
+
+    def fazer_logs(self, tempo_evento):
+        while self.proximo_log <= tempo_evento:
+            total_fila = sum(len(f) for f in self.filas.values())
+            self.log_fila.append((self.proximo_log, total_fila))
+            
+            medicos_ocupados = sum(1 for m in self.medicos if not m.livre)
+            taxa_ocupacao = (medicos_ocupados / len(self.medicos)) * 100 if self.medicos else 0
+            self.log_ocupacao.append((self.proximo_log, taxa_ocupacao))
+
+            self.proximo_log += self.intervalo_log
+
+    def executar(self):
+        while self.eventos:
+            t_evt, tipo, doente = heapq.heappop(self.eventos)
+            
+            if t_evt > self.tempo_total and tipo == "CHEGADA":
+                continue
+            
+            self.tempo = t_evt
+            self.fazer_logs(self.tempo)
+
+            for esp_fila in self.filas.values():
+                for p_fila in esp_fila:
+                    p_fila.tempo_na_fila = self.tempo - p_fila.tempo_chegada
+
+            if tipo == "CHEGADA":
+                med = self.get_medico_livre(doente.especialidade)
+                if med:
+                    med.livre = False
+                    duracao = self.gerar_tempo_servico()
+                    doente.tempo_inicio = self.tempo
+                    doente.tempo_saida = self.tempo + duracao
+                    doente.medico_nome = f"Dr.{med.id}"
+                    doente.obj_medico = med
+                    med.tempo_ocupado_total += duracao
+                    heapq.heappush(self.eventos, (doente.tempo_saida, "SAIDA", doente))
+                else:
+                    heapq.heappush(self.filas[doente.especialidade], doente)
+            
+            elif tipo == "SAIDA":
+                self.atendidos.append(doente)
+                med = doente.obj_medico
+                if med:
+                    if self.filas[med.especialidade]:
+                        prox = heapq.heappop(self.filas[med.especialidade])
+                        duracao = self.gerar_tempo_servico()
+                        prox.tempo_inicio = self.tempo
+                        prox.tempo_saida = self.tempo + duracao
+                        prox.medico_nome = f"Dr.{med.id}"
+                        prox.obj_medico = med
+                        med.tempo_ocupado_total += duracao
+                        heapq.heappush(self.eventos, (prox.tempo_saida, "SAIDA", prox))
+                    else:
+                        med.livre = True
+        
+        self.fazer_logs(self.tempo_total)
+        
+        return {
+            "atendidos": self.atendidos, 
+            "log_fila": self.log_fila, 
+            "medicos": self.medicos,
+            "log_ocupacao": self.log_ocupacao
+        }
+
+
+def executar_cenarios_variados(config_base):
+    resultados_cenarios = []
+    taxas_teste = range(10, 31, 2)
+
+    for taxa in taxas_teste:
+        dados_temp = []
+        tempo_atual = 0.0
+        tempo_limite = 480.0
+        contador = 1
+        while tempo_atual < tempo_limite:
+            intervalo = random.expovariate(taxa / 60.0)
+            tempo_atual += intervalo
+            if tempo_atual < tempo_limite:
+                dados_temp.append({
+                    "id": contador, "nome": f"P {contador}", "idade": 30,
+                    "especialidade": random.choice(["Clínica Geral", "Cardiologia", "Ortopedia"]),
+                    "prioridade": random.choice([1, 2, 3]), "tempo_chegada": round(tempo_atual, 1)
+                })
+                contador += 1
+        
+        cfg_run = {
+            "tempo_total": config_base["tempo_total"], "tempo_medio": config_base["tempo_medio"],
+            "distribuicao": config_base["distribuicao"], "qtd_especialidades": {
+                "Clínica Geral": config_base["medicos_geral"], "Cardiologia": config_base["medicos_cardio"], "Ortopedia": config_base["medicos_orto"]
+            }
+        }
+        
+        sim = Simulador(dados_temp, cfg_run)
+        resultados = sim.executar()
+        
+        espera_media_global = np.mean([p.espera() for p in resultados["atendidos"]]) if resultados["atendidos"] else 0
+        resultados_cenarios.append({"taxa_chegada": taxa, "espera_media": espera_media_global})
+        
+    return resultados_cenarios
+
+# =============================================================================
+# 3. PREVISÃO MENSAL
+# =============================================================================
+
+def gerar_pacientes_dia(taxa_chegada, dia_semana=0):
+    ajuste = 1.0
+    if dia_semana == 0: ajuste = 1.2
+    elif dia_semana == 4: ajuste = 1.1
+    elif dia_semana >= 5: ajuste = 0.5
+    
+    taxa_ajustada = taxa_chegada * ajuste
+    dados = []
+    nomes_ex = ["Ana", "Bruno", "Carlos", "Diana", "Eduardo", "Fernanda", "Gustavo", "Helena", "Igor", "Julia"]
+    esps = ["Clínica Geral", "Cardiologia", "Ortopedia"]
+    
+    qtd = int(taxa_ajustada * 8)
+    for i in range(1, qtd + 1):
+        p = {
+            "id": i, "nome": f"{random.choice(nomes_ex)} {i}", "idade": random.randint(1, 95),
+            "especialidade": random.choice(esps), "prioridade": random.choice([1, 2, 3]),
+            "tempo_chegada": round(random.uniform(0, 480), 1) 
+        }
+        dados.append(p)
+    dados.sort(key=lambda x: x["tempo_chegada"])
+    return dados
+
+def simular_mes(config_base):
+    resultados_mensais = {}
+    hoje = datetime.now()
+    ano, mes = hoje.year, hoje.month
+    num_dias = calendar.monthrange(ano, mes)[1]
+    
+    for dia in range(1, num_dias + 1):
+        data_atual = datetime(ano, mes, dia)
+        dia_semana = data_atual.weekday()
+        pacientes_dia = gerar_pacientes_dia(config_base["taxa_chegada"], dia_semana)
+        
+        cfg_run = {
+            "tempo_total": 480, "tempo_medio": config_base["tempo_medio"],
+            "distribuicao": config_base["distribuicao"], "qtd_especialidades": {
+                "Clínica Geral": config_base["medicos_geral"], "Cardiologia": config_base["medicos_cardio"], "Ortopedia": config_base["medicos_orto"]
+            }
+        }
+        
+        sim = Simulador(pacientes_dia, cfg_run)
+        res = sim.executar()
+        
+        espera_media = np.mean([p.espera() for p in res["atendidos"]]) if res["atendidos"] else 0
+        ocupacao_media = np.mean([(m.tempo_ocupado_total / 480.0) * 100 for m in res["medicos"]]) if res["medicos"] else 0
+        
+        resultados_mensais[dia] = {
+            "data": data_atual.strftime("%d/%m"), "dia_semana": dia_semana,
+            "pacientes": len(res["atendidos"]), "espera": espera_media, "ocupacao": ocupacao_media
+        }
+    return resultados_mensais
+
+def janela_calendario(dados_mensais):
+    hoje = datetime.now()
+    ano, mes = hoje.year, hoje.month
+    cal = calendar.monthcalendar(ano, mes)
+    mes_nome = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"][mes-1]
+    
+    dias_semana = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+    header = [sg.Text(d, size=(10, 1), justification="center", font=("Helvetica", 10, "bold")) for d in dias_semana]
+    
+    rows = []
+    for week in cal:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(sg.Frame("", [[sg.Text("", size=(10, 4))]], border_width=0))
+            else:
+                info = dados_mensais.get(day, {"pacientes": 0, "espera": 0, "ocupacao": 0})
+                bg_color = "#ffffff"
+                if info["ocupacao"] > 85: bg_color = "#ffcccc"
+                elif info["ocupacao"] > 60: bg_color = "#fff3cd"
+                elif info["ocupacao"] > 0: bg_color = "#d4edda"
+                
+                txt = f"{day}\nDoentes: {info['pacientes']}\nEsp: {info['espera']:.0f}m\nOcup: {info['ocupacao']:.0f}%"
+                row.append(sg.Frame("", [[sg.Text(txt, size=(10, 4), background_color=bg_color, justification="center", font=("Helvetica", 8))]], border_width=1))
+        rows.append(row)
+    
+    layout = [
+        [sg.Text(f"Previsão Mensal - {mes_nome} {ano}", font=("Helvetica", 16, "bold"), justification="center", expand_x=True)],
+        [sg.HorizontalSeparator()],
+        header, *rows,
+        [sg.Button("Fechar", size=(10, 1), pad=(0, 10))]
+    ]
+    
+    win = sg.Window("Calendário de Previsão", layout, modal=True, element_justification="center")
+    
+    janela_aberta = True
+    while janela_aberta:
+        event, _ = win.read()
+        if event in (sg.WIN_CLOSED, "Fechar"):
+            janela_aberta = False
+            
+    win.close()
+
+# =============================================================================
+# 4. VISUALIZAÇÃO
+# =============================================================================
+
+def janela_graficos(resultados_sim, resultados_cenarios):
+    if not resultados_sim:
+        sg.popup_error("Não há dados da simulação para mostrar.")
+        return # return aqui é seguro pois não está em loop
+
+    plt.style.use("ggplot")
+
+    def criar_fig_fila():
+        fig = plt.figure(figsize=(6, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        if resultados_sim["log_fila"]:
+            x, y = zip(*resultados_sim["log_fila"])
+            ax.step(x, y, where="post", color="#2980b9", label="Nº de Doentes")
+            ax.fill_between(x, y, step="post", alpha=0.3, color="#2980b9")
+        ax.set_title("Evolução do Tamanho da Fila de Espera")
+        ax.set_xlabel("Tempo de Simulação (minutos)")
+        ax.set_ylabel("Nº de Doentes na Fila")
+        ax.grid(True); ax.legend()
+        return fig
+
+    def criar_fig_ocupacao():
+        fig = plt.figure(figsize=(6, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        if resultados_sim["log_ocupacao"]:
+            x, y = zip(*resultados_sim["log_ocupacao"])
+            ax.plot(x, y, color="#d47a70", label="Taxa de Ocupação")
+            ax.fill_between(x, y, alpha=0.3, color="#d47a70")
+        ax.set_title("Evolução da Taxa de Ocupação dos Médicos")
+        ax.set_xlabel("Tempo de Simulação (minutos)")
+        ax.set_ylabel("Ocupação (%)")
+        ax.set_ylim(0, 100); ax.grid(True); ax.legend()
+        return fig
+
+    def criar_fig_sensibilidade():
+        fig = plt.figure(figsize=(6, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        if resultados_cenarios:
+            taxas = [r["taxa_chegada"] for r in resultados_cenarios]
+            esperas = [r["espera_media"] for r in resultados_cenarios]
+            ax.plot(taxas, esperas, marker="o", linestyle="-", color="#8e44ad")
+        ax.set_title("Tempo de Espera Médio vs. Taxa de Chegada")
+        ax.set_xlabel("Taxa de Chegada de Doentes (doentes/hora)")
+        ax.set_ylabel("Tempo Médio de Espera (minutos)")
+        ax.grid(True)
+        return fig
+
+    layout_tab1 = [[sg.Canvas(key="-CANVAS1-")]]
+    layout_tab2 = [[sg.Canvas(key="-CANVAS2-")]]
+    layout_tab3 = [[sg.Canvas(key="-CANVAS3-")]]
+
+    atendidos = resultados_sim["atendidos"]
+    medicos = resultados_sim["medicos"]
+    total_at = len(atendidos)
+    espera_global = np.mean([p.espera() for p in atendidos]) if atendidos else 0
+    ocup_media = np.mean([(m.tempo_ocupado_total / 480.0) * 100 for m in medicos]) if medicos else 0
+    
+    texto_stats = f"Doentes Atendidos: {total_at}\n" \
+                  f"Tempo Médio de Espera Global: {espera_global:.1f} min\n" \
+                  f"Taxa de Ocupação Média: {ocup_media:.1f}%\n\n"
+    
+    t_espera_prio = {1: [], 2: [], 3: []}
+    for p in atendidos: t_espera_prio[p.prioridade].append(p.espera())
+    for prio, label in [(1, "Urgente"), (2, "Moderado"), (3, "Normal")]:
+        media = np.mean(t_espera_prio[prio]) if t_espera_prio[prio] else 0
+        texto_stats += f"Espera Média - Prioridade {label}: {media:.1f} min\n"
+
+    layout_tab4 = [[sg.Text("Resumo da Simulação", font=("Times New Roman", 16, "bold"))],
+                   [sg.Text(texto_stats, font=("Courier New", 12))]]
+
+    tab_group_layout = [[
+        sg.Tab("Fila de Espera", layout_tab1), sg.Tab("Ocupação Médicos", layout_tab2),
+        sg.Tab("Análise Sensibilidade", layout_tab3), sg.Tab("Estatísticas", layout_tab4, element_justification="c")
+    ]]
+
+    layout_g = [[sg.TabGroup(tab_group_layout)], [sg.Button("Fechar")]]
+    window_g = sg.Window("Dashboard de Análise", layout_g, finalize=True, modal=True, resizable=True)
+
+    def draw_figure(canvas, figure):
+        figure_canvas_agg = FigureCanvasTkAgg(figure, canvas)
+        figure_canvas_agg.draw()
+        figure_canvas_agg.get_tk_widget().pack(side="top", fill="both", expand=1)
+        return figure_canvas_agg
+
+    draw_figure(window_g["-CANVAS1-"].TKCanvas, criar_fig_fila())
+    draw_figure(window_g["-CANVAS2-"].TKCanvas, criar_fig_ocupacao())
+    draw_figure(window_g["-CANVAS3-"].TKCanvas, criar_fig_sensibilidade())
+
+    janela_aberta = True
+    while janela_aberta:
+        event, values = window_g.read()
+        if event in (sg.WIN_CLOSED, "Fechar"):
+            janela_aberta = False
+    window_g.close()
+
+def janela_tabela(resultados):
+    if resultados and resultados["atendidos"]:
+        lista = sorted(resultados["atendidos"], key=lambda p: p.tempo_chegada)
+        cols = ["ID", "Nome", "Idade", "Especialidade", "Prio", "Chegada", "Médico", "Início", "Saída", "Duração", "Espera"]
+        dados_tab = [[p.id_sim, p.nome, p.idade, p.especialidade, p.prioridade,
+                      formatar_hora(p.tempo_chegada), p.medico_nome, formatar_hora(p.tempo_inicio),
+                      formatar_hora(p.tempo_saida), f"{p.duracao():.1f}", f"{p.espera():.1f}"] for p in lista]
+        
+        row_colors = []
+        for i, p in enumerate(lista):
+            if p.prioridade == 1: color = ("white", "#d47a70")
+            elif p.prioridade == 2: color = ("black", "#decb80")
+            else: color = ("black", "#98d9b3")
+            row_colors.append((i, color[1]))
+
+        layout_t = [[sg.Text("Relatório de Atendimento", font=("Times New Roman", 16, "bold"))],
+                    [sg.Table(values=dados_tab, headings=cols, auto_size_columns=False, 
+                              col_widths=[4, 12, 5, 15, 4, 8, 8, 8, 8, 8, 8],
+                              justification="center", num_rows=20, expand_x=True, expand_y=True,
+                              row_colors=row_colors, header_background_color="#2c3e50", header_text_color="white")],
+                    [sg.Button("Fechar", size=(10, 1))]]
+        win_t = sg.Window("Tabela de Dados", layout_t, size=(1100, 600), modal=True, resizable=True)
+        
+        janela_aberta = True
+        while janela_aberta:
+            event, _ = win_t.read()
+            if event in (sg.WIN_CLOSED, "Fechar"):
+                janela_aberta = False
+        win_t.close()
+    else:
+        sg.popup("Não há dados de atendimentos para mostrar.")
+
+def exportar_resultados_csv(resultados, nome_arquivo="relatorio_simulacao.csv"):
+    if not resultados or not resultados["atendidos"]:
+        sg.popup_error("Não há resultados de simulação para exportar.")
+        return False # return aqui é seguro pois não está em loop
+
+    lista = sorted(resultados["atendidos"], key=lambda p: p.tempo_chegada)
+    cols = ["ID", "Nome", "Idade", "Especialidade", "Prioridade", "Tempo Chegada", 
+            "Médico", "Tempo Início", "Tempo Saída", "Duração Consulta", "Tempo Espera"]
+    
+    try:
+        with open(nome_arquivo, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(cols)
+            for p in lista:
+                writer.writerow([
+                    p.id_sim, p.nome, p.idade, p.especialidade, p.prioridade,
+                    formatar_hora(p.tempo_chegada), p.medico_nome, formatar_hora(p.tempo_inicio),
+                    formatar_hora(p.tempo_saida), f"{p.duracao():.1f}", f"{p.espera():.1f}"
+                ])
+        sg.popup(f"Relatório exportado com sucesso para {nome_arquivo}")
+        return True
+    except Exception as e:
+        sg.popup_error(f"Erro ao exportar relatório: {e}")
+        return False
+
+# =============================================================================
+# 5. INTERFACE PRINCIPAL
+# =============================================================================
+
+sg.theme("LightGreen8")
+
+config = {
+    "medicos_geral": 2, "medicos_cardio": 1, "medicos_orto": 1,
+    "distribuicao": "Normal", "tempo_medio": 20, "taxa_chegada": 5, "tempo_total": 480
+}
+resultados_ult_simulacao = None
+resultados_analise_sensibilidade = None
+
+menu_inicial = [
+    [sg.Button("Configurar Clínica", size=(20, 2), font=("Times New Roman", 14)), 
+     sg.Button("Executar Simulação", size=(20, 2), font=("Times New Roman", 14))],
+    [sg.Button("Previsão Mensal", size=(20, 2), font=("Times New Roman", 14)),
+     sg.Button("Gráficos de Análise", size=(20, 2), font=("Times New Roman", 14))],
+    [sg.Button("Relatório Tabela", size=(20, 2), font=("Times New Roman", 14)),
+     sg.Button("Exportar CSV", size=(20, 2), font=("Times New Roman", 14), key="-EXPORT_CSV-")],
+    [sg.Button("Importar JSON", size=(20, 2), font=("Times New Roman", 14), key="-IMPORT-"),
+     sg.Button("Gerar Novo Cenário", size=(20, 2), font=("Times New Roman", 14), key="-RESET-")],
+    [sg.Button("Ajuda", size=(20, 1), font=("Times New Roman", 14), key="-HELP-", button_color=("slategrey", "white")),
+     sg.Button("Sair", size=(20, 1), font=("Times New Roman", 14))]
+]
+
+layout = [
+    [sg.Text("SIMULADOR DE CLÍNICA MÉDICA", expand_x=True, justification="center", font=("Times New Roman", 28, "bold"))],
+    [sg.Text("Chegadas Aleatórias (08h-16h) | Prioridade Dinâmica", expand_x=True, justification="center", font=("Times New Roman", 16))],
+    [sg.Text("_", size=(100, 1), justification="center", text_color="White", pad=(0, 10))],
+    [sg.Column(menu_inicial, element_justification="c")],
+    [sg.Text("Estado: Aguardando Simulação...", key="-VE-", font=("Times New Roman", 12), text_color="DarkBlue", justification="c", expand_x=True)],
+    [sg.Text("_", size=(100, 1), justification="center", text_color="White", pad=(0, 10))]
+]
+
+window = sg.Window("Simulação Clínica", layout, size=(850, 600))
+
+
+executando = True
+while executando:
+    event, values = window.read()
+    
+    if event in ("Sair", sg.WIN_CLOSED):
+        executando = False
+    
+    elif event == "-HELP-":
+        ajuda_texto = ("Guia de Funcionalidades dos Botões:\n\n"
+            "• Configurar Clínica: Permite ajustar o número de médicos por especialidade, "
+            "a taxa de chegada de doentes, o tempo médio de consulta e o tipo de distribuição estatística.\n\n"
+            "• Executar Simulação: Inicia o processamento dos dados dos pacientes com base nas configurações atuais. "
+            "É necessário ter dados carregados (via Importar ou Gerar Novo Cenário).\n\n"
+            "• Relatório Tabela: Abre uma janela com a lista detalhada de todos os pacientes atendidos, "
+            "incluindo tempos de espera, início e fim de consulta, e o médico responsável.\n\n"
+            "• Gráficos de Análise: Mostra o dashboard visual com a evolução da fila, ocupação dos médicos, "
+            "estatísticas gerais e análise de sensibilidade.\n\n"
+            "• Exportar CSV: Exporta os resultados detalhados da última simulação para um ficheiro CSV.\n\n"
+            "• Importar JSON: Permite carregar uma lista de pacientes a partir de um ficheiro externo no formato .json.\n\n"
+            "• Gerar Novo Cenário: Cria aleatoriamente uma nova lista de pacientes para a simulação com base na taxa de chegada configurada.\n\n"
+            "• Sair: Encerra a aplicação."
+        )
+        sg.popup_scrolled(ajuda_texto, title="Ajuda", font=("Times New Roman", 12), size=(60, 15))
+
+    elif event == "Configurar Clínica":
+        layout_cfg = [
+            [sg.Text("Médicos Clínica Geral:", size=(25,1)), sg.Spin(list(range(1,10)), initial_value=config["medicos_geral"], key="-G-")],
+            [sg.Text("Médicos Cardiologia:", size=(25,1)), sg.Spin(list(range(1,10)), initial_value=config["medicos_cardio"], key="-C-")],
+            [sg.Text("Médicos Ortopedia:", size=(25,1)), sg.Spin(list(range(1,10)), initial_value=config["medicos_orto"], key="-O-")],
+            [sg.Text("Taxa de Chegada (doentes/h):", size=(25,1)), sg.Input(config["taxa_chegada"], key="-TX-", size=(5,1))],
+            [sg.Text("Tempo Médio Consulta (min):", size=(25,1)), sg.Input(config["tempo_medio"], key="-TM-", size=(5,1))],
+            [sg.Text("Distribuição Tempo:", size=(25,1)), sg.Combo(["Exponencial", "Normal", "Uniforme"], default_value=config["distribuicao"], key="-D-")],
+            [sg.Button("Guardar", size=(15,1), pad=(0,10))]
+        ]
+        w_cfg = sg.Window("Configuração", layout_cfg, font=("Times New Roman", 12), modal=True)
+        e_c, v_c = w_cfg.read(close=True)
+        if e_c == "Guardar":
+            try:
+                config["medicos_geral"] = int(v_c["-G-"])
+                config["medicos_cardio"] = int(v_c["-C-"])
+                config["medicos_orto"] = int(v_c["-O-"])
+                config["taxa_chegada"] = float(v_c["-TX-"])
+                config["tempo_medio"] = float(v_c["-TM-"])
+                config["distribuicao"] = v_c["-D-"]
+                window["-VE-"].update("Configuração Atualizada.")
+            except: sg.popup_error("Erro nos valores.")
+
+    elif event == "Previsão Mensal":
+        window["-VE-"].update("A calcular previsão mensal... Por favor aguarde.")
+        window.refresh()
+        dados_mensais = simular_mes(config)
+        janela_calendario(dados_mensais)
+        window["-VE-"].update("Previsão Mensal Concluída.")
+
+    elif event == "Executar Simulação":
+        pacientes = carregar_pacientes_db()
+        if not pacientes: window["-VE-"].update("Erro: DB Vazio.")
+        else:
+            window["-VE-"].update("A executar simulação...")
+            window.refresh()
+            
+            config_run = config.copy()
+            config_run["qtd_especialidades"] = {
+                "Clínica Geral": config["medicos_geral"],
+                "Cardiologia": config["medicos_cardio"],
+                "Ortopedia": config["medicos_orto"]
+            }
+            
+            sim = Simulador(pacientes, config_run)
+            resultados_ult_simulacao = sim.executar()
+            resultados_analise_sensibilidade = None
+            window["-VE-"].update(f"Simulação Concluída! {len(resultados_ult_simulacao['atendidos'])} doentes.")
+
+    elif event == "Gráficos de Análise":
+        if resultados_ult_simulacao:
+            if not resultados_analise_sensibilidade:
+                window["-VE-"].update("A gerar análise de sensibilidade...")
+                window.refresh()
+                resultados_analise_sensibilidade = executar_cenarios_variados(config)
+            janela_graficos(resultados_ult_simulacao, resultados_analise_sensibilidade)
+            window["-VE-"].update("Gráficos abertos.")
+        else: sg.popup("Execute a simulação primeiro!")
+
+    elif event == "Relatório Tabela":
+        if resultados_ult_simulacao: janela_tabela(resultados_ult_simulacao)
+        else: sg.popup("Execute a simulação primeiro!")
+
+    elif event == "-EXPORT_CSV-":
+        if resultados_ult_simulacao: exportar_resultados_csv(resultados_ult_simulacao)
+        else: sg.popup("Execute a simulação primeiro!")
+
+    elif event == "-IMPORT-":
+        caminho = sg.popup_get_file("Selecione o JSON", file_types=(("JSON Files", "*.json"),))
+        if caminho and importar_json_externo(caminho, config["taxa_chegada"]):
+            window["-VE-"].update("Importado com sucesso.")
+
+    elif event == "-RESET-":
+        qtd = criar_json_cenario(config["taxa_chegada"])
+        window["-VE-"].update(f"Novo cenário: {qtd} pacientes.")
+
+window.close()
